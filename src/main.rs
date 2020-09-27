@@ -2,11 +2,12 @@ extern crate kvm_ioctls;
 extern crate kvm_bindings;
 
 use std::env;
+use std::io::{self, Write};
 use std::path::Path;
 use std::process;
 use std::ptr;
 
-use kvm_bindings::KVM_MEM_LOG_DIRTY_PAGES;
+use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, KVM_MAX_CPUID_ENTRIES};
 use kvm_bindings::kvm_userspace_memory_region;
 use kvm_ioctls::VcpuExit;
 use kvm_ioctls::{Kvm, VmFd, VcpuFd};
@@ -14,10 +15,12 @@ use kvm_ioctls::{Kvm, VmFd, VcpuFd};
 mod kernel;
 
 const MMIO_KVMLINUX_INT: u64 = 0xff000;
+const MMIO_KVMLINUX_UART: u64 = 0xff010;
+const MMIO_KVMLINUX_UART_HI: u64 = 0xff018;
 static BIOS_BYTES: &[u8] = include_bytes!("../bios.bin");
 
 struct Machine {
-    _kvm: Kvm,
+    kvm: Kvm,
     vm: VmFd,
     cpu: VcpuFd,
 }
@@ -29,7 +32,7 @@ impl Machine {
         let cpu = vm.create_vcpu(0)?;
 
         Ok(Machine {
-            _kvm: kvm,
+            kvm,
             vm,
             cpu,
         })
@@ -38,7 +41,7 @@ impl Machine {
     fn dump_csip(&self) {
         let regs = self.cpu.get_regs().unwrap();
         let sregs = self.cpu.get_sregs().unwrap();
-        println!("CS:IP => {:04x}:{:08x}", sregs.cs.selector, regs.rip);
+        eprintln!("CS:IP => {:04x}:{:08x}", sregs.cs.selector, regs.rip);
     }
 }
 
@@ -58,6 +61,10 @@ fn main() {
 
     let kernel = kernel::Image::open(Path::new(&args[1])).unwrap();
     let machine = Machine::new().unwrap();
+
+    // just pass thru the host cpuid
+    let supported_cpuid = machine.kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES).unwrap();
+    machine.cpu.set_cpuid2(&supported_cpuid);
 
     const SETUP_BASE: usize = 0x1000;
     const SETUP_LOAD: usize = 0x1200;
@@ -194,8 +201,9 @@ fn main() {
         // set heap end
         write_16(setup_virt, kernel::K_HEAP_END_PTR_W, HEAP_END as u16);
 
-        // cmdline lives at HEAP_END - no cmdline just yet
-        write_8(setup_virt, HEAP_END, 0);
+        // cmdline lives at HEAP_END
+        let cmdline = b"noapic console=uart,mmio,0xff010\0";
+        ptr::copy(cmdline.as_ptr(), lowmem_virt.add(HEAP_END), cmdline.len());
         write_32(setup_virt, kernel::K_CMD_LINE_PTR_D, HEAP_END as u32);
     }
 
@@ -227,8 +235,8 @@ fn main() {
     loop {
         match machine.cpu.run() {
             Ok(VcpuExit::IoIn(addr, data)) => {
-                println!(
-                    "Received an I/O in exit. Address: {:#x}. Data: {:#x}",
+                eprintln!(
+                    "IO in, Address: {:#x}. Data: {:#x}",
                     addr,
                     data[0],
                 );
@@ -236,21 +244,32 @@ fn main() {
                 machine.dump_csip();
             }
             Ok(VcpuExit::IoOut(addr, data)) => {
-                println!(
-                    "Received an I/O out exit. Address: {:#x}. Data: {:#x}",
+                eprintln!(
+                    "IO out, Address: {:#x}. Data: {:#x}",
                     addr,
                     data[0],
                 );
 
                 machine.dump_csip();
             }
-            Ok(VcpuExit::MmioRead(addr, _data)) => {
-                println!(
-                    "Received an MMIO Read Request for the address {:#x}.",
-                    addr,
-                );
+            Ok(VcpuExit::MmioRead(addr, data)) => {
+                if addr >= MMIO_KVMLINUX_UART && addr < MMIO_KVMLINUX_UART_HI {
+                    let reg = addr - MMIO_KVMLINUX_UART;
 
-                machine.dump_csip();
+                    if reg == 5 {
+                        data[0] = 0x60; // UART_LSR_TEMT | UART_LSR_THRE, iow
+                                        // transmitter buffers empty, ready to receive
+                    } else {
+                        eprintln!("Read from UART reg {}", reg);
+                    }
+                } else {
+                    eprintln!(
+                        "Received an MMIO Read Request for the address {:#x}.",
+                        addr,
+                    );
+
+                    machine.dump_csip();
+                }
             }
             Ok(VcpuExit::MmioWrite(addr, data)) => {
                 if addr == MMIO_KVMLINUX_INT {
@@ -261,13 +280,37 @@ fn main() {
                     let csip_ptr = sregs.ss.base + regs.rsp + 6;
                     let csip = unsafe { *(lowmem_virt.add(csip_ptr as usize) as *mut u32) };
 
-                    println!("Interrupt 0x{:02x} at {:04x}:{:04x}! AX={:04x}",
-                        data[0],
+                    let int_nr = data[0];
+
+                    eprintln!("Interrupt 0x{:02x} at {:04x}:{:04x}! AX={:04x}",
+                        int_nr,
                         csip >> 16,
                         csip & 0xffff,
                         regs.rax & 0xffff);
+
+                    if int_nr == 0x10 && (regs.rax >> 8) & 0xff == 0x0e {
+                        eprintln!("print char!!");
+
+                        let c = (regs.rax & 0xff) as u8;
+
+                        // put char
+                        let mut stdout = io::stdout();
+                        stdout.write(&[c]).unwrap();
+                        stdout.flush().unwrap();
+                    }
+                } else if addr >= MMIO_KVMLINUX_UART && addr < MMIO_KVMLINUX_UART_HI {
+                    let reg = addr - MMIO_KVMLINUX_UART;
+
+                    if reg == 0 {
+                        // write reg
+                        let mut stdout = io::stdout();
+                        stdout.write(&[data[0]]).unwrap();
+                        stdout.flush().unwrap();
+                    } else {
+                        eprintln!("Write to UART reg {}", reg);
+                    }
                 } else {
-                    println!(
+                    eprintln!(
                         "Received an MMIO Write Request to the address {:#x}.",
                         addr,
                     );
@@ -276,12 +319,12 @@ fn main() {
                 }
             }
             Ok(VcpuExit::Hlt) => {
-                println!("Halt.");
+                eprintln!("Halt.");
                 machine.dump_csip();
                 break;
             }
             Err(e) if e.errno() == libc::EINTR => {
-                machine.dump_csip();
+                // machine.dump_csip();
 
                 // let events = machine.cpu.get_vcpu_events().unwrap();
                 // println!("Events: {:#?}", events);

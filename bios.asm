@@ -1,7 +1,7 @@
 bits 16
 org 0
 
-%define MMIO_KVMLINUX_INT 0xff000
+%define MMIO_KVMLINUX_INT       0xff000
 
 %macro isr 1
     push word %1
@@ -40,5 +40,3 @@ isr_common:
     ; balance stack and return
     add sp, 2
     iret
-
-int 0x7f
