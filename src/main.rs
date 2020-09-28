@@ -2,21 +2,25 @@ extern crate kvm_ioctls;
 extern crate kvm_bindings;
 
 use std::env;
+use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process;
 use std::ptr;
 
 use kvm_bindings::{KVM_MEM_LOG_DIRTY_PAGES, KVM_MAX_CPUID_ENTRIES};
-use kvm_bindings::kvm_userspace_memory_region;
+use kvm_bindings::{kvm_userspace_memory_region, kvm_pit_config};
 use kvm_ioctls::VcpuExit;
 use kvm_ioctls::{Kvm, VmFd, VcpuFd};
 
 mod kernel;
 
+const PAGE_SIZE: u64 = 0x1000;
+
 const MMIO_KVMLINUX_INT: u64 = 0xff000;
 const MMIO_KVMLINUX_UART: u64 = 0xff010;
 const MMIO_KVMLINUX_UART_HI: u64 = 0xff018;
+
 static BIOS_BYTES: &[u8] = include_bytes!("../bios.bin");
 
 struct Machine {
@@ -29,6 +33,8 @@ impl Machine {
     pub fn new() -> Result<Self, kvm_ioctls::Error> {
         let kvm = Kvm::new()?;
         let vm = kvm.create_vm()?;
+        vm.create_pit2(kvm_pit_config::default())?;
+        vm.create_irq_chip()?;
         let cpu = vm.create_vcpu(0)?;
 
         Ok(Machine {
@@ -54,17 +60,19 @@ fn main() {
 
     let args = env::args_os().collect::<Vec<_>>();
 
-    if args.len() != 2 {
-        eprintln!("usage: kvmlinux <path to bzimage>");
+    if args.len() != 3 {
+        eprintln!("usage: kvmlinux <path to bzimage> <path to initramfs>");
         process::exit(0);
     }
 
     let kernel = kernel::Image::open(Path::new(&args[1])).unwrap();
+    let initramfs = fs::read(&args[2]).unwrap();
+
     let machine = Machine::new().unwrap();
 
     // just pass thru the host cpuid
     let supported_cpuid = machine.kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES).unwrap();
-    machine.cpu.set_cpuid2(&supported_cpuid);
+    machine.cpu.set_cpuid2(&supported_cpuid).unwrap();
 
     const SETUP_BASE: usize = 0x1000;
     const SETUP_LOAD: usize = 0x1200;
@@ -78,6 +86,9 @@ fn main() {
 
     let bios_addr = 0xf0000;
     let bios_size = 0x1000;
+
+    let kernel_len_aligned = (kernel.kernel_code().len() as u64 + (PAGE_SIZE - 1)) & !(PAGE_SIZE - 1);
+    let initramfs_addr = extmem_addr + kernel_len_aligned;
 
     // TODO check errors for these mmaps...
 
@@ -164,6 +175,9 @@ fn main() {
         let kern = kernel.kernel_code();
         ptr::copy(kern.as_ptr(), extmem_virt, kern.len());
 
+        let initramfs_virt = extmem_virt.add((initramfs_addr - extmem_addr) as usize);
+        ptr::copy(initramfs.as_ptr(), initramfs_virt, initramfs.len());
+
         ptr::copy(BIOS_BYTES.as_ptr(), bios_virt, BIOS_BYTES.len());
     }
 
@@ -194,15 +208,15 @@ fn main() {
         const CAN_USE_HEAP_FLAG: u8 = 0x80;
         write_8(setup_virt, kernel::K_LOADFLAGS_B, LOADED_HIGH_FLAG | CAN_USE_HEAP_FLAG);
 
-        // no ramdisk
-        write_32(setup_virt, kernel::K_RAMDISK_SIZE_D, 0);
-        write_32(setup_virt, kernel::K_RAMDISK_IMAGE_D, 0);
+        // ramdisk
+        write_32(setup_virt, kernel::K_RAMDISK_SIZE_D, initramfs.len() as u32);
+        write_32(setup_virt, kernel::K_RAMDISK_IMAGE_D, initramfs_addr as u32);
 
         // set heap end
         write_16(setup_virt, kernel::K_HEAP_END_PTR_W, HEAP_END as u16);
 
         // cmdline lives at HEAP_END
-        let cmdline = b"noapic console=uart,mmio,0xff010\0";
+        let cmdline = b"quiet initrd=1 root=/dev/ram init=/busybox console=uart,mmio,0xff010\0";
         ptr::copy(cmdline.as_ptr(), lowmem_virt.add(HEAP_END), cmdline.len());
         write_32(setup_virt, kernel::K_CMD_LINE_PTR_D, HEAP_END as u32);
     }
